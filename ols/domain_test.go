@@ -23,26 +23,65 @@ func TestDomainInfo(t *testing.T) {
 	}
 }
 
-func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+func TestClassifyTerm(t *testing.T) {
+	typ, id, err := Domain{}.Classify("GO:0051301")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	for _, tc := range cases {
-		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
-		}
+	if typ != "term" {
+		t.Errorf("type = %q, want term", typ)
+	}
+	if id != "GO:0051301" {
+		t.Errorf("id = %q, want GO:0051301", id)
 	}
 }
 
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+func TestClassifyOntology(t *testing.T) {
+	typ, id, err := Domain{}.Classify("go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if typ != "ontology" {
+		t.Errorf("type = %q, want ontology", typ)
+	}
+	if id != "go" {
+		t.Errorf("id = %q, want go", id)
+	}
+}
+
+func TestClassifyEmpty(t *testing.T) {
+	_, _, err := Domain{}.Classify("")
+	if err == nil {
+		t.Error("Classify(\"\") should return an error")
+	}
+}
+
+func TestLocateTerm(t *testing.T) {
+	got, err := Domain{}.Locate("term", "GO:0051301")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "https://www.ebi.ac.uk/ols4/ontologies/go/terms/http%253A%252F%252Fpurl.obolibrary.org%252Fobo%252FGO_0051301"
+	if got != want {
+		t.Errorf("Locate(term, GO:0051301) = %q, want %q", got, want)
+	}
+}
+
+func TestLocateOntology(t *testing.T) {
+	got, err := Domain{}.Locate("ontology", "go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "https://www.ebi.ac.uk/ols4/ontologies/go"
+	if got != want {
+		t.Errorf("Locate(ontology, go) = %q, want %q", got, want)
+	}
+}
+
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("page", "foo")
+	if err == nil {
+		t.Error("Locate with unknown type should return an error")
 	}
 }
 
@@ -56,21 +95,23 @@ func TestHostWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+	term := &Term{
+		ID:          "GO:0051301",
+		Label:       "cell division",
+		Description: "The process resulting in division and partitioning of components of a cell.",
+		Ontology:    "go",
+		Prefix:      "GO",
+	}
+	u, err := h.Mint(term)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "ols://page/wiki/Go"; u.String() != want {
+	if want := "ols://term/GO:0051301"; u.String() != want {
 		t.Errorf("Mint = %q, want %q", u.String(), want)
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("ols", "about")
-	if err != nil || got.String() != "ols://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want ols://page/about", got.String(), err)
+	got, err := h.ResolveOn("ols", "MONDO:0700096")
+	if err != nil || got.String() != "ols://term/MONDO:0700096" {
+		t.Errorf("ResolveOn = (%q, %v), want ols://term/MONDO:0700096", got.String(), err)
 	}
 }

@@ -1,35 +1,38 @@
 // Package ols is the library behind the ols command line:
-// the HTTP client, request shaping, and the typed data models for ols.
+// the HTTP client, request shaping, and the typed data models for the
+// EMBL-EBI Ontology Lookup Service (OLS4).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
+// transient failures (429 and 5xx) that any public API throws under load.
 // Build your endpoint calls and JSON decoding on top of it.
 package ols
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to ols. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "ols/dev (+https://github.com/tamnd/ols-cli)"
+// DefaultUserAgent identifies the client to OLS4.
+const DefaultUserAgent = "ols-cli/0.1.0 (+https://github.com/tamnd/ols-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at ols.com; change it once you
-// know the real endpoints you want to read.
-const Host = "ols.com"
+// Host is the OLS4 site this client talks to.
+const Host = "www.ebi.ac.uk"
+
+// HostShort is a short display name for the service.
+const HostShort = "ols4"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://www.ebi.ac.uk/ols4/api"
 
-// Client talks to ols over HTTP.
+// Client talks to OLS4 over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,21 +43,20 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 300ms
+// minimum gap between requests, and three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Get fetches rawURL and returns the response body. It paces and retries
+// according to the client's settings. The body is read fully and closed here.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +66,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,16 +75,17 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -123,78 +126,188 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on ols.com. It is a stand-in for the typed records you
-// will model from the real ols endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `ols cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- wire types (unexported) ---
+
+type wireSearchDoc struct {
+	OboID           string   `json:"obo_id"`
+	Label           string   `json:"label"`
+	Description     []string `json:"description"`
+	OntologyName    string   `json:"ontology_name"`
+	OntologyPrefix  string   `json:"ontology_prefix"`
+	ExactSynonyms   []string `json:"exact_synonyms"`
+	RelatedSynonyms []string `json:"related_synonyms"`
+	IsObsolete      bool     `json:"is_obsolete"`
+	Type            string   `json:"type"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+type wireSearchResp struct {
+	Response struct {
+		NumFound int             `json:"numFound"`
+		Docs     []wireSearchDoc `json:"docs"`
+	} `json:"response"`
+}
+
+type wireOntologyConfig struct {
+	Title           string `json:"title"`
+	Description     string `json:"description"`
+	Namespace       string `json:"namespace"`
+	Version         string `json:"version"`
+	PreferredPrefix string `json:"preferredPrefix"`
+}
+
+type wireOntology struct {
+	OntologyId string             `json:"ontologyId"`
+	Config     wireOntologyConfig `json:"config"`
+}
+
+type wireOntologyResp struct {
+	Page     struct{ TotalElements int `json:"totalElements"` } `json:"page"`
+	Embedded struct{ Ontologies []wireOntology `json:"ontologies"` } `json:"_embedded"`
+}
+
+// --- public types ---
+
+// Term is a single OLS4 ontology term record.
+type Term struct {
+	ID          string   `json:"id"          kit:"id"` // obo_id
+	Label       string   `json:"label"`
+	Description string   `json:"description"`
+	Ontology    string   `json:"ontology"`
+	Prefix      string   `json:"prefix"`
+	Synonyms    []string `json:"synonyms"`
+	IsObsolete  bool     `json:"is_obsolete"`
+}
+
+// Ontology is a single OLS4 ontology record.
+type Ontology struct {
+	ID          string `json:"id"          kit:"id"` // ontologyId
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Prefix      string `json:"prefix"`
+	Version     string `json:"version"`
+}
+
+// --- client methods ---
+
+// SearchTerms queries the OLS4 search API and returns matching Term records
+// along with the total count. If ontology is non-empty, results are filtered
+// to that ontology only.
+func (c *Client) SearchTerms(ctx context.Context, query, ontology string, limit, offset int) ([]Term, int, error) {
+	rawURL := c.searchURL(query, ontology, limit, offset)
+	return c.searchTermsURL(ctx, rawURL)
+}
+
+// searchURL builds the search endpoint URL. It is the testable core of
+// SearchTerms; tests point it at an httptest server without touching BaseURL.
+func (c *Client) searchURL(query, ontology string, limit, offset int) string {
+	if limit <= 0 {
+		limit = 10
+	}
+	params := url.Values{
+		"q":    {query},
+		"rows": {strconv.Itoa(limit)},
+		"type": {"term"},
+	}
+	if offset > 0 {
+		params.Set("start", strconv.Itoa(offset))
+	}
+	if ontology != "" {
+		params.Set("ontology", strings.ToLower(ontology))
+	}
+	return BaseURL + "/search?" + params.Encode()
+}
+
+func (c *Client) searchTermsURL(ctx context.Context, rawURL string) ([]Term, int, error) {
+	body, err := c.Get(ctx, rawURL)
+	if err != nil {
+		return nil, 0, err
+	}
+	var ws wireSearchResp
+	if err := json.Unmarshal(body, &ws); err != nil {
+		return nil, 0, fmt.Errorf("search parse: %w", err)
+	}
+	out := make([]Term, 0, len(ws.Response.Docs))
+	for _, d := range ws.Response.Docs {
+		out = append(out, termFromDoc(d))
+	}
+	return out, ws.Response.NumFound, nil
+}
+
+// GetTerm fetches a single ontology term by its OBO ID (e.g. "GO:0051301").
+// It uses the search endpoint to resolve the ID to a canonical term record.
+// The ontology parameter is used to narrow the search when provided.
+func (c *Client) GetTerm(ctx context.Context, oboID, ontology string) (*Term, error) {
+	terms, _, err := c.SearchTerms(ctx, `obo_id:"`+oboID+`"`, ontology, 1, 0)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+	if len(terms) == 0 {
+		return nil, fmt.Errorf("term %q not found", oboID)
+	}
+	return &terms[0], nil
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+// GetOntologies lists ontologies from OLS4. It returns up to limit results.
+func (c *Client) GetOntologies(ctx context.Context, limit int) ([]Ontology, int, error) {
+	rawURL := c.ontologiesURL(limit)
+	return c.ontologiesFromURL(ctx, rawURL)
+}
+
+// ontologiesURL builds the ontologies endpoint URL.
+func (c *Client) ontologiesURL(limit int) string {
+	if limit <= 0 {
+		limit = 20
+	}
+	params := url.Values{
+		"size": {strconv.Itoa(limit)},
+		"page": {"0"},
+	}
+	return BaseURL + "/ontologies?" + params.Encode()
+}
+
+func (c *Client) ontologiesFromURL(ctx context.Context, rawURL string) ([]Ontology, int, error) {
+	body, err := c.Get(ctx, rawURL)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	var ws wireOntologyResp
+	if err := json.Unmarshal(body, &ws); err != nil {
+		return nil, 0, fmt.Errorf("ontologies parse: %w", err)
 	}
-	return out, nil
+	out := make([]Ontology, 0, len(ws.Embedded.Ontologies))
+	for _, o := range ws.Embedded.Ontologies {
+		out = append(out, ontologyFromWire(o))
+	}
+	return out, ws.Page.TotalElements, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// --- helpers ---
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// termFromDoc converts a search doc wire type to a Term.
+func termFromDoc(d wireSearchDoc) Term {
+	desc := ""
+	if len(d.Description) > 0 {
+		desc = d.Description[0]
 	}
-	return out
+	synonyms := append(d.ExactSynonyms, d.RelatedSynonyms...)
+	return Term{
+		ID:          d.OboID,
+		Label:       d.Label,
+		Description: desc,
+		Ontology:    d.OntologyName,
+		Prefix:      d.OntologyPrefix,
+		Synonyms:    synonyms,
+		IsObsolete:  d.IsObsolete,
+	}
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// ontologyFromWire converts a wire ontology type to an Ontology.
+func ontologyFromWire(o wireOntology) Ontology {
+	return Ontology{
+		ID:          o.OntologyId,
+		Title:       o.Config.Title,
+		Description: o.Config.Description,
+		Prefix:      o.Config.PreferredPrefix,
+		Version:     o.Config.Version,
 	}
-	return s
 }
